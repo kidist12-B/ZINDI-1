@@ -1,0 +1,196 @@
+!pip install lightgbm xgboost catboost
+
+import pandas as pd
+import numpy as np
+import warnings
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import mean_absolute_error
+from catboost import CatBoostClassifier
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+
+warnings.filterwarnings('ignore')
+
+# ===============================
+# LOAD DATA
+# ===============================
+train = pd.read_csv('Train.csv')
+test = pd.read_csv('Test.csv')
+
+train['bank_account'] = train['bank_account'].map({'Yes': 1, 'No': 0})
+
+features = [c for c in train.columns if c not in ['uniqueid', 'bank_account']]
+
+X = train[features]
+y = train['bank_account']
+X_test = test[features]
+
+cat_cols = ['country', 'location_type', 'cellphone_access', 'gender_of_respondent',
+            'relationship_with_head', 'marital_status', 'education_level', 'job_type']
+
+# ===============================
+# FEATURE ENGINEERING
+# ===============================
+def create_features(df):
+    df = df.copy()
+
+    df['age_of_respondent'] = np.clip(df['age_of_respondent'], 16, 90)
+
+    df['is_stable'] = ((df['marital_status'] == 'Married/Living together') &
+                       (df['relationship_with_head'] == 'Head of Household')).astype(int)
+
+    df['edu_job_interaction'] = df['education_level'].astype(str) + "_" + df['job_type'].astype(str)
+
+    df['household_pressure'] = df['household_size'] / (df['age_of_respondent'] + 1)
+
+    edu_map = {'No formal education': 0, 'Primary education': 1, 'Secondary education': 2,
+               'Vocational/Specialised training': 3, 'Tertiary education': 4,
+               'Other/Dont know/RTA': 1}
+
+    df['edu_score'] = df['education_level'].map(edu_map).fillna(1)
+
+    return df
+
+# ===============================
+# CV SETUP
+# ===============================
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+oof_preds = np.zeros(len(X))
+test_preds = np.zeros(len(X_test))
+
+spw = (len(y) - sum(y)) / sum(y)
+
+# ===============================
+# MAIN LOOP
+# ===============================
+for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
+    print(f"Fold {fold+1}")
+
+    X_tr, X_val = X.iloc[tr_idx].copy(), X.iloc[val_idx].copy()
+    y_tr, y_val = y.iloc[tr_idx], y.iloc[val_idx]
+
+    # ---------------------------
+    # SAFE IMPUTATION
+    # ---------------------------
+    for col in ['education_level', 'job_type']:
+        mode_map = X_tr.groupby('country')[col].agg(lambda x: x.mode()[0] if not x.mode().empty else 'Unknown')
+        X_tr[col] = X_tr[col].fillna(X_tr['country'].map(mode_map))
+        X_val[col] = X_val[col].fillna(X_val['country'].map(mode_map))
+        X_test[col] = X_test[col].fillna(X_test['country'].map(mode_map))
+
+    # ---------------------------
+    # FEATURE ENGINEERING
+    # ---------------------------
+    X_tr = create_features(X_tr)
+    X_val = create_features(X_val)
+    X_test_fold = create_features(X_test.copy())
+
+    # ---------------------------
+    # FREQUENCY ENCODING
+    # ---------------------------
+    for col in cat_cols:
+        freq = X_tr[col].value_counts()
+        X_tr[col + "_freq"] = X_tr[col].map(freq)
+        X_val[col + "_freq"] = X_val[col].map(freq)
+        X_test_fold[col + "_freq"] = X_test_fold[col].map(freq)
+
+    # ---------------------------
+    # 🔥 FIXED TARGET ENCODING
+    # ---------------------------
+    temp = X_tr.copy()
+    temp['target'] = y_tr
+
+    for col in cat_cols:
+        target_map = temp.groupby(col)['target'].mean()
+        X_tr[col + "_target"] = X_tr[col].map(target_map)
+        X_val[col + "_target"] = X_val[col].map(target_map)
+        X_test_fold[col + "_target"] = X_test_fold[col].map(target_map)
+
+    # ---------------------------
+    # CATEGORY TYPE
+    # ---------------------------
+    all_cat = cat_cols + ['edu_job_interaction']
+    for col in all_cat:
+        X_tr[col] = X_tr[col].astype('category')
+        X_val[col] = X_val[col].astype('category')
+        X_test_fold[col] = X_test_fold[col].astype('category')
+
+    cat_idx = [X_tr.columns.get_loc(c) for c in all_cat]
+
+    # ===============================
+    # MODELS
+    # ===============================
+    cat = CatBoostClassifier(
+        iterations=1500,
+        learning_rate=0.03,
+        depth=6,
+        l2_leaf_reg=3,
+        cat_features=cat_idx,
+        early_stopping_rounds=100,
+        verbose=False
+    )
+
+    xgb = XGBClassifier(
+        n_estimators=1200,
+        learning_rate=0.03,
+        max_depth=5,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        scale_pos_weight=spw,
+        enable_categorical=True,
+        eval_metric='logloss'
+    )
+
+    lgb = LGBMClassifier(
+        n_estimators=1200,
+        learning_rate=0.03,
+        num_leaves=31,
+        scale_pos_weight=spw
+    )
+
+    # TRAIN
+    cat.fit(X_tr, y_tr, eval_set=(X_val, y_val), verbose=False)
+    xgb.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+    lgb.fit(X_tr, y_tr)
+
+    # PRED
+    val_preds = (
+        0.6 * cat.predict_proba(X_val)[:, 1] +
+        0.2 * xgb.predict_proba(X_val)[:, 1] +
+        0.2 * lgb.predict_proba(X_val)[:, 1]
+    )
+
+    test_preds += (
+        0.6 * cat.predict_proba(X_test_fold)[:, 1] +
+        0.2 * xgb.predict_proba(X_test_fold)[:, 1] +
+        0.2 * lgb.predict_proba(X_test_fold)[:, 1]
+    ) / skf.n_splits
+
+    oof_preds[val_idx] = val_preds
+
+# ===============================
+# THRESHOLD
+# ===============================
+best_t = 0.5
+best_mae = 1
+
+for t in np.linspace(0.01, 0.99, 200):
+    mae = mean_absolute_error(y, (oof_preds > t).astype(int))
+    if mae < best_mae:
+        best_mae = mae
+        best_t = t
+
+print("CV MAE:", best_mae, "Threshold:", best_t)
+
+# ===============================
+# SUBMISSION
+# ===============================
+submission = pd.DataFrame({
+    'unique_id': test['uniqueid'].astype(str) + ' x ' + test['country'].astype(str),
+    'bank_account': (test_preds > best_t).astype(int)
+})
+
+submission.to_csv("zindi_top_pipeline_fixed.csv", index=False)
+print("🔥 DONE")
